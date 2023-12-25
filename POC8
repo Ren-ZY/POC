@@ -1,0 +1,9 @@
+    pub fn peek(&mut self) -> Result<&(Event, Marker), ScanError> {            // 第6行为函数调用处
+        match self.current {
+            Some(ref x) => Ok(x),
+            None => {
+                self.current = Some(try!(self.next()));
+                self.peek()
+            }
+        }
+    }
