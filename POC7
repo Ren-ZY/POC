@@ -1,0 +1,13 @@
+impl<'a> Deserializer<'a> {                           
+    fn deserialize_scalar<'de, V>(&mut self, visitor: V) -> Result<V::Value>                  //第8行是递归函数调用处
+    where
+        V: Visitor<'de>,
+    {
+        let (next, marker) = self.next()?;
+        match *next {
+            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_scalar(visitor),
+            Event::Scalar(ref v, style, ref tag) => visit_scalar(v, style, tag, visitor),
+            ref other => Err(invalid_type(other, &visitor)),
+        }.map_err(|err| err.fix_marker(marker, self.path))
+    }
+}
