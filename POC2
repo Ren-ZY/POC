@@ -1,0 +1,268 @@
+impl<Handle, Sink> TreeBuilder<Handle, Sink>      //step是存在问题的递归函数，75，150，161行是函数调用处
+    where Handle: Clone,
+          Sink: TreeSink<Handle=Handle>,
+{
+    fn step(&mut self, mode: InsertionMode, token: Token) -> ProcessResult<Handle> {
+        self.debug_step(mode, &token);
+
+        match mode {
+            //§ the-initial-insertion-mode
+            Initial => match_token!(token {
+                CharacterTokens(NotSplit, text) => SplitWhitespace(text),
+                CharacterTokens(Whitespace, _) => Done,
+                CommentToken(text) => self.append_comment_to_doc(text),
+                token => {
+                    if !self.opts.iframe_srcdoc {
+                        self.unexpected(&token);
+                        self.set_quirks_mode(Quirks);
+                    }
+                    Reprocess(BeforeHtml, token)
+                }
+            }),
+
+            //§ the-before-html-insertion-mode
+            BeforeHtml => match_token!(token {
+                CharacterTokens(NotSplit, text) => SplitWhitespace(text),
+                CharacterTokens(Whitespace, _) => Done,
+                CommentToken(text) => self.append_comment_to_doc(text),
+
+                tag @ <html> => {
+                    self.create_root(tag.attrs);
+                    self.mode = BeforeHead;
+                    Done
+                }
+
+                </head> </body> </html> </br> => else,
+
+                tag @ </_> => self.unexpected(&tag),
+
+                token => {
+                    self.create_root(vec!());
+                    Reprocess(BeforeHead, token)
+                }
+            }),
+
+            //§ the-before-head-insertion-mode
+            BeforeHead => match_token!(token {
+                CharacterTokens(NotSplit, text) => SplitWhitespace(text),
+                CharacterTokens(Whitespace, _) => Done,
+                CommentToken(text) => self.append_comment(text),
+
+                <html> => self.step(InBody, token),
+
+                tag @ <head> => {
+                    self.head_elem = Some(self.insert_element_for(tag));
+                    self.mode = InHead;
+                    Done
+                }
+
+                </head> </body> </html> </br> => else,
+
+                tag @ </_> => self.unexpected(&tag),
+
+                token => {
+                    self.head_elem = Some(self.insert_phantom(local_name!("head")));
+                    Reprocess(InHead, token)
+                }
+            }),
+
+            //§ parsing-main-inhead
+            InHead => match_token!(token {
+                CharacterTokens(NotSplit, text) => SplitWhitespace(text),
+                CharacterTokens(Whitespace, text) => self.append_text(text),
+                CommentToken(text) => self.append_comment(text),
+
+                <html> => self.step(InBody, token),
+
+                tag @ <base> <basefont> <bgsound> <link> <meta> => {
+                    // FIXME: handle <meta charset=...> and <meta http-equiv="Content-Type">
+                    self.insert_and_pop_element_for(tag);
+                    DoneAckSelfClosing
+                }
+
+                tag @ <title> => {
+                    self.parse_raw_data(tag, Rcdata)
+                }
+
+                tag @ <noframes> <style> <noscript> => {
+                    if (!self.opts.scripting_enabled) && (tag.name == local_name!("noscript")) {
+                        self.insert_element_for(tag);
+                        self.mode = InHeadNoscript;
+                        Done
+                    } else {
+                        self.parse_raw_data(tag, Rawtext)
+                    }
+                }
+
+                tag @ <script> => {
+                    let elem = create_element(
+                        &mut self.sink, QualName::new(None, ns!(html), local_name!("script")),
+                        tag.attrs);
+                    if self.is_fragment() {
+                        self.sink.mark_script_already_started(&elem);
+                    }
+                    self.insert_appropriately(AppendNode(elem.clone()), None);
+                    self.open_elems.push(elem);
+                    self.to_raw_text_mode(ScriptData)
+                }
+
+                </head> => {
+                    self.pop();
+                    self.mode = AfterHead;
+                    Done
+                }
+
+                </body> </html> </br> => else,
+
+                tag @ <template> => {
+                    self.insert_element_for(tag);
+                    self.active_formatting.push(Marker);
+                    self.frameset_ok = false;
+                    self.mode = InTemplate;
+                    self.template_modes.push(InTemplate);
+                    Done
+                }
+
+                tag @ </template> => {
+                    if !self.in_html_elem_named(local_name!("template")) {
+                        self.unexpected(&tag);
+                    } else {
+                        self.generate_implied_end(thorough_implied_end);
+                        self.expect_to_close(local_name!("template"));
+                        self.clear_active_formatting_to_marker();
+                        self.template_modes.pop();
+                        self.mode = self.reset_insertion_mode();
+                    }
+                    Done
+                }
+
+                <head> => self.unexpected(&token),
+                tag @ </_> => self.unexpected(&tag),
+
+                token => {
+                    self.pop();
+                    Reprocess(AfterHead, token)
+                }
+            }),
+
+            //§ parsing-main-inheadnoscript
+            InHeadNoscript => match_token!(token {
+                <html> => self.step(InBody, token),
+
+                </noscript> => {
+                    self.pop();
+                    self.mode = InHead;
+                    Done
+                },
+
+                CharacterTokens(NotSplit, text) => SplitWhitespace(text),
+                CharacterTokens(Whitespace, _) => self.step(InHead, token),
+
+                CommentToken(_) => self.step(InHead, token),
+
+                <basefont> <bgsound> <link> <meta> <noframes> <style>
+                    => self.step(InHead, token),
+
+                </br> => else,
+
+                <head> <noscript> => self.unexpected(&token),
+                tag @ </_> => self.unexpected(&tag),
+
+                token => {
+                    self.unexpected(&token);
+                    self.pop();
+                    Reprocess(InHead, token)
+                },
+            }),
+
+            //§ the-after-head-insertion-mode
+            AfterHead => match_token!(token {
+                CharacterTokens(NotSplit, text) => SplitWhitespace(text),
+                CharacterTokens(Whitespace, text) => self.append_text(text),
+                CommentToken(text) => self.append_comment(text),
+
+                <html> => self.step(InBody, token),
+
+                tag @ <body> => {
+                    self.insert_element_for(tag);
+                    self.frameset_ok = false;
+                    self.mode = InBody;
+                    Done
+                }
+
+                tag @ <frameset> => {
+                    self.insert_element_for(tag);
+                    self.mode = InFrameset;
+                    Done
+                }
+
+                <base> <basefont> <bgsound> <link> <meta>
+                      <noframes> <script> <style> <template> <title> => {
+                    self.unexpected(&token);
+                    let head = self.head_elem.as_ref().expect("no head element").clone();
+                    self.push(&head);
+                    let result = self.step(InHead, token);
+                    self.remove_from_stack(&head);
+                    result
+                }
+
+                </template> => self.step(InHead, token),
+
+                </body> </html> </br> => else,
+
+                <head> => self.unexpected(&token),
+                tag @ </_> => self.unexpected(&tag),
+
+                token => {
+                    self.insert_phantom(local_name!("body"));
+                    Reprocess(InBody, token)
+                }
+            }),
+
+            //§ parsing-main-inbody
+            InBody => match_token!(token {
+                NullCharacterToken => self.unexpected(&token),
+
+                CharacterTokens(_, text) => {
+                    self.reconstruct_formatting();
+                    if any_not_whitespace(&text) {
+                        self.frameset_ok = false;
+                    }
+                    self.append_text(text)
+                }
+
+                CommentToken(text) => self.append_comment(text),
+
+                tag @ <html> => {
+                    self.unexpected(&tag);
+                    if !self.in_html_elem_named(local_name!("template")) {
+                        let top = html_elem(&self.open_elems);
+                        self.sink.add_attrs_if_missing(top, tag.attrs);
+                    }
+                    Done
+                }
+
+                <base> <basefont> <bgsound> <link> <meta> <noframes>
+                  <script> <style> <template> <title> </template> => {
+                    self.step(InHead, token)
+                }
+
+                tag @ <body> => {
+                    self.unexpected(&tag);
+                    match self.body_elem().cloned() {
+                        Some(ref node) if self.open_elems.len() != 1 &&
+                                          !self.in_html_elem_named(local_name!("template")) => {
+                            self.frameset_ok = false;
+                            self.sink.add_attrs_if_missing(node, tag.attrs)
+                        },
+                        _ => {}
+                    }
+                    Done
+                }
+
+                tag @ <frameset> => {
+                    self.unexpected(&tag);
+                    if !self.frameset_ok { return Done; }
+
+                    let body = unwrap_or_return!(self.body_elem(), Done).clone();
+                    self.sink.remove_from_parent(&body);
