@@ -1,0 +1,19 @@
+ pub fn search<'a>(&'a self, key: &str) -> Option<&'a Json> {       //在第8行调用自身产生栈溢出
+        match self {
+            &Json::Object(ref map) => {
+                match map.get(key) {
+                    Some(json_value) => Some(json_value),
+                    None => {
+                        for (_, v) in map.iter() {
+                            match v.search(key) {
+                                x if x.is_some() => return x,
+                                _ => ()
+                            }
+                        }
+                        None
+                    }
+                }
+            },
+            _ => None
+        }
+    } 
