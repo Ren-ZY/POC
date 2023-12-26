@@ -1,0 +1,110 @@
+fn read_inner(
+    decoder: &mut BinDecoder<'_>,
+    name: &mut Name,
+    max_idx: Option<usize>,
+) -> Result<(), DecodeError> {
+    let mut state: LabelParseState = LabelParseState::LabelLengthOrPointer;
+    let name_start = decoder.index();
+
+    // assume all chars are utf-8. We're doing byte-by-byte operations, no endianess issues...
+    // reserved: (1000 0000 aka 0800) && (0100 0000 aka 0400)
+    // pointer: (slice == 1100 0000 aka C0) & C0 == true, then 03FF & slice = offset
+    // label: 03FF & slice = length; slice.next(length) = label
+    // root: 0000
+    loop {
+        // this protects against overlapping labels
+        if let Some(max_idx) = max_idx {
+            if decoder.index() >= max_idx {
+                return Err(DecodeError::LabelOverlapsWithOther {
+                    label: name_start,
+                    other: max_idx,
+                });
+            }
+        }
+
+        state = match state {
+            LabelParseState::LabelLengthOrPointer => {
+                // determine what the next label is
+                match decoder
+                    .peek()
+                    .map(Restrict::unverified /*verified in this usage*/)
+                {
+                    Some(0) | None => LabelParseState::Root,
+                    Some(byte) if byte & 0b1100_0000 == 0b1100_0000 => LabelParseState::Pointer,
+                    Some(byte) if byte & 0b1100_0000 == 0b0000_0000 => LabelParseState::Label,
+                    Some(byte) => return Err(DecodeError::UnrecognizedLabelCode(byte)),
+                }
+            }
+            // labels must have a maximum length of 63
+            LabelParseState::Label => {
+                let label = decoder
+                    .read_character_data()?
+                    .verify_unwrap(|l| l.len() <= 63)
+                    .map_err(|l| DecodeError::LabelBytesTooLong(l.len()))?;
+
+                name.extend_name(label)
+                    .map_err(|_| DecodeError::DomainNameTooLong(label.len()))?;
+
+                // reset to collect more data
+                LabelParseState::LabelLengthOrPointer
+            }
+            //         4.1.4. Message compression
+            //
+            // In order to reduce the size of messages, the domain system utilizes a
+            // compression scheme which eliminates the repetition of domain names in a
+            // message.  In this scheme, an entire domain name or a list of labels at
+            // the end of a domain name is replaced with a pointer to a prior occurrence
+            // of the same name.
+            //
+            // The pointer takes the form of a two octet sequence:
+            //
+            //     +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+            //     | 1  1|                OFFSET                   |
+            //     +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+            //
+            // The first two bits are ones.  This allows a pointer to be distinguished
+            // from a label, since the label must begin with two zero bits because
+            // labels are restricted to 63 octets or less.  (The 10 and 01 combinations
+            // are reserved for future use.)  The OFFSET field specifies an offset from
+            // the start of the message (i.e., the first octet of the ID field in the
+            // domain header).  A zero offset specifies the first byte of the ID field,
+            // etc.
+            LabelParseState::Pointer => {
+                let pointer_location = decoder.index();
+                let location = decoder
+                    .read_u16()?
+                    .map(|u| {
+                        // get rid of the two high order bits, they are markers for length or pointers
+                        u & 0x3FFF
+                    })
+                    .verify_unwrap(|ptr| {
+                        // all labels must appear "prior" to this Name
+                        (*ptr as usize) < name_start
+                    })
+                    .map_err(|e| DecodeError::PointerNotPriorToLabel {
+                        idx: pointer_location,
+                        ptr: e,
+                    })?;
+
+                let mut pointer = decoder.clone(location);
+                read_inner(&mut pointer, name, Some(name_start))?;
+
+                // Pointers always finish the name, break like Root.
+                break;
+            }
+            LabelParseState::Root => {
+                // need to pop() the 0 off the stack...
+                decoder.pop()?;
+                break;
+            }
+        }
+    }
+
+    // TODO: should we consider checking this while the name is parsed?
+    let len = name.len();
+    if len >= 255 {
+        return Err(DecodeError::DomainNameTooLong(len));
+    }
+
+    Ok(())
+}
